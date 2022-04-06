@@ -22,12 +22,13 @@ maxlen = 32
 batch_size = 128
 steps_per_epoch = 1000
 epochs = 10000
-corpus_path = 'data_sample.json'
+corpus_path = 'data.json'
 
 # bert配置
-config_path = '/root/kg/bert/chinese_L-12_H-768_A-12/bert_config.json'
-checkpoint_path = '/root/kg/bert/chinese_L-12_H-768_A-12/bert_model.ckpt'
-dict_path = '/root/kg/bert/chinese_L-12_H-768_A-12/vocab.txt'
+bert_dirt = '/root/huxiang/data/'
+config_path = bert_dirt + 'bert/chinese_L-12_H-768_A-12/bert_config.json'
+checkpoint_path = bert_dirt + 'bert/chinese_L-12_H-768_A-12/bert_model.ckpt'
+dict_path = bert_dirt + 'bert/chinese_L-12_H-768_A-12/vocab.txt'
 
 # 加载并精简词表，建立分词器
 token_dict, keep_tokens = load_vocab(
@@ -36,6 +37,8 @@ token_dict, keep_tokens = load_vocab(
     startswith=['[PAD]', '[UNK]', '[CLS]', '[SEP]'],
 )
 tokenizer = Tokenizer(token_dict, do_lower_case=True)
+
+
 
 
 def read_corpus():
@@ -63,20 +66,23 @@ class data_generator(DataGenerator):
 
     def __iter__(self, random=False):
         batch_token_ids, batch_segment_ids = [], []
-        for is_end, d in self.sample(random):
-            text, synonyms = d['text'], d['synonyms']
-            synonyms = [text] + synonyms
+        for is_end, synonyms in self.sample(random):
+            # text, synonyms = d['text'], d['synonyms']
+            # synonyms = [text] + synonyms
             np.random.shuffle(synonyms)
+            # 每次随机挑选两个同义句子
             text, synonym = synonyms[:2]
             text, synonym = truncate(text), truncate(synonym)
             self.some_samples.append(text)
             if len(self.some_samples) > 1000:
                 self.some_samples.pop(0)
+            # 1. text -> synonym
             token_ids, segment_ids = tokenizer.encode(
                 text, synonym, max_length=maxlen * 2
             )
             batch_token_ids.append(token_ids)
             batch_segment_ids.append(segment_ids)
+            # 2. synonym -> text
             token_ids, segment_ids = tokenizer.encode(
                 synonym, text, max_length=maxlen * 2
             )
@@ -88,7 +94,11 @@ class data_generator(DataGenerator):
                 yield [batch_token_ids, batch_segment_ids], None
                 batch_token_ids, batch_segment_ids = [], []
 
+# train_generator = data_generator(read_corpus(), batch_size)
 
+# for d in train_generator:
+#     print(d)
+#     break
 class TotalLoss(Loss):
     """loss分两部分，一是seq2seq的交叉熵，二是相似度的交叉熵。
     """
@@ -100,6 +110,7 @@ class TotalLoss(Loss):
         return loss1 + loss2
 
     def compute_loss_of_seq2seq(self, inputs, mask=None):
+        """seq2seq loss：其实就是每个位置的交叉熵"""
         y_true, y_mask, _, y_pred = inputs
         y_true = y_true[:, 1:]  # 目标token_ids
         y_mask = y_mask[:, 1:]  # segment_ids，刚好指示了要预测的部分
@@ -109,6 +120,8 @@ class TotalLoss(Loss):
         return loss
 
     def compute_loss_of_similarity(self, inputs, mask=None):
+        """相似loss：把batch内所有的非相似样本都当作负样本，
+        借助softmax来增加相似样本的相似度，降低其余样本的相似度。"""
         _, _, y_pred, _ = inputs
         y_true = self.get_labels_of_similarity(y_pred)  # 构建标签
         y_pred = K.l2_normalize(y_pred, axis=1)  # 句向量归一化
@@ -156,12 +169,14 @@ class SynonymsGenerator(AutoRegressiveDecoder):
     """
     @AutoRegressiveDecoder.set_rtype('probas')
     def predict(self, inputs, output_ids, step):
+        """拿到每个句子的embedding，用于做相似度计算和排序"""
         token_ids, segment_ids = inputs
         token_ids = np.concatenate([token_ids, output_ids], 1)
         segment_ids = np.concatenate([segment_ids, np.ones_like(output_ids)], 1)
         return seq2seq.predict([token_ids, segment_ids])[:, -1]
 
     def generate(self, text, n=1, topk=5):
+        """根据text生成相似句子"""
         token_ids, segment_ids = tokenizer.encode(text, max_length=maxlen)
         output_ids = self.random_sample([token_ids, segment_ids], n,
                                         topk)  # 基于随机采样
@@ -191,9 +206,11 @@ def gen_synonyms(text, n=100, k=20):
             u'微信和支付宝选哪个好',
         ]
     """
+    # 1. 随机采样生成n个句子
     r = synonyms_generator.generate(text, n)
-    r = [i for i in set(r) if i != text]
-    r = [text] + r
+    r = [i for i in set(r) if i != text] # 去重
+    r = [text] + r # 加上原始句子
+    # 2. 拿到每个句子的token和segment
     X, S = [], []
     for t in r:
         x, s = tokenizer.encode(t)
@@ -201,10 +218,14 @@ def gen_synonyms(text, n=100, k=20):
         S.append(s)
     X = sequence_padding(X)
     S = sequence_padding(S)
+    # 3. 预测每个句子的embedding
     Z = encoder.predict([X, S])
     Z /= (Z**2).sum(axis=1, keepdims=True)**0.5
+    # 4. 与原始text做点积后排序
     argsort = np.dot(Z[1:], -Z[0]).argsort()
+    # 5. 取k个最相似的句子
     return [r[i + 1] for i in argsort[:k]]
+
 
 
 def just_show():
@@ -253,3 +274,6 @@ if __name__ == '__main__':
 else:
 
     model.load_weights('./latest_model.weights')
+
+# 肾哀如果眼睛很不见于术后能看见吗
+# 肾哀如果眼晴很不见于术后能看见吗
